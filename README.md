@@ -1,1 +1,1 @@
-# chessAI
+# MyAIChess
