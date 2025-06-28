@@ -7,6 +7,18 @@
 #include "Gomoku.h"
 #include "Node.h"
 #include "SafeQueue.h"
+#include "TrivialArena.h"
+
+struct MCTS_Config;   // 先声明MCTS_Config结构体
+enum class MCTS_MODE; // 再声明MCTS_MODE枚举
+std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
+    const Gomoku &root_state,
+    const std::deque<BitboardState> &history,
+    InferenceEngine &engine,
+    const MCTS_Config &config,
+    MCTS_MODE mode,
+    TrivialArena &node_arena,
+    TrivialArena &gomoku_arena);
 #include <iostream>
 #include <string>
 #include <chrono>
@@ -16,30 +28,158 @@
 #include <algorithm>
 #include <atomic>
 
+// vvvvvv 在此处粘贴以下代码块 vvvvvv
+// 为了兼容性，定义popcount
+#ifdef _MSC_VER
+#include <intrin.h>
+#define popcount __popcnt64
+#else
+#define popcount __builtin_popcountll
+#endif
+// ^^^^^^ 在此处粘贴以上代码块 ^^^^^^
+
 // ======================= 新增的、仅供人机对战使用的引擎缓存 =======================
 // 用于存储已经加载的模型，避免在对战中重复从硬盘读取
 static std::mutex g_engine_mutex;
 static std::map<std::string, std::shared_ptr<InferenceEngine>> g_engines;
 
 // 一个辅助函数，用于获取一个缓存的或新加载的引擎实例
-std::shared_ptr<InferenceEngine> get_cached_engine(const std::string& model_path, bool use_gpu) {
+std::shared_ptr<InferenceEngine> get_cached_engine(const std::string &model_path, bool use_gpu)
+{
     std::lock_guard<std::mutex> lock(g_engine_mutex);
-    if (g_engines.find(model_path) == g_engines.end()) {
+    if (g_engines.find(model_path) == g_engines.end())
+    {
         std::cout << "[C++ Engine Cache] Caching new model for interactive play: " << model_path << std::endl;
         g_engines[model_path] = std::make_shared<InferenceEngine>(model_path, use_gpu);
     }
     return g_engines[model_path];
 }
 // ==============================================================================
+/*
+Gomoku reconstruct_game_state(const Node *target_node, const Gomoku &root_state)
+{
+    if (target_node->parent_ == nullptr)
+    {
+        // 如果目标节点是根节点，直接返回根状态的拷贝
+        return root_state;
+    }
+
+    // 从目标节点向上遍历到根节点，收集路径上的所有动作
+    std::vector<int> actions;
+    const Node *current_node = target_node;
+    while (current_node->parent_ != nullptr)
+    {
+        actions.push_back(current_node->action_taken_);
+        current_node = current_node->parent_;
+    }
+
+    // 因为是从下往上收集的，所以需要反转得到正确的执行顺序
+    std::reverse(actions.begin(), actions.end());
+
+    // 从根状态开始，按顺序执行所有动作，以重构出目标节点的状态
+    Gomoku reconstructed_state = root_state;
+    for (int action : actions)
+    {
+        reconstructed_state.execute_move(action);
+    }
+    return reconstructed_state;
+}
+*/
+
+// file: cpp_src/SelfPlayManager.cpp
+
+// =======================================================
+// ===== 带缓存功能的状态获取函数（双竞技场最终版） =====
+// =======================================================
+const Gomoku& get_or_reconstruct_state(
+    const Node* target_node,
+    const Gomoku& root_state,
+    TrivialArena& gomoku_arena // <-- 接收竞技场
+) {
+    // 1. 缓存命中，直接返回 (逻辑不变)
+    if (target_node->cached_state_) {
+        return *target_node->cached_state_;
+    }
+
+    // 2. 如果是根节点，使用 gomoku_arena 创建缓存
+    if (target_node->parent_ == nullptr) {
+        // vvvvvv 【核心修改】 vvvvvv
+        // 使用 placement new 在竞技场上构造 Gomoku 对象
+        target_node->cached_state_ = new (gomoku_arena.allocate<Gomoku>()) Gomoku(root_state);
+        // ^^^^^^ 【核心修改】 ^^^^^^
+        return *target_node->cached_state_;
+    }
+
+    // 3. 缓存未命中，递归调用，并传入竞技场
+    // vvvvvv 【核心修改】 vvvvvv
+    const Gomoku& parent_state = get_or_reconstruct_state(target_node->parent_, root_state, gomoku_arena);
+    // ^^^^^^ 【核心修改】 ^^^^^^
+
+    // 4. 使用 gomoku_arena 创建子节点的状态缓存
+    // vvvvvv 【核心修改】 vvvvvv
+    Gomoku* new_state = new (gomoku_arena.allocate<Gomoku>()) Gomoku(parent_state);
+    new_state->execute_move(target_node->action_taken_);
+    target_node->cached_state_ = new_state;
+    // ^^^^^^ 【核心修改】 ^^^^^^
+
+    return *target_node->cached_state_;
+}
+
+// ==================== 新增：历史收集辅助函数 ====================
+std::deque<BitboardState> gather_history_for_leaf(
+    const Node *leaf_node,
+    const Gomoku &root_state,
+    const std::deque<BitboardState> &root_history,
+    int history_steps)
+{
+    // 如果不需要历史，直接返回空
+    if (history_steps == 0)
+    {
+        return {};
+    }
+
+    // 1. 从叶子节点向上走到根节点，收集路径上的所有动作
+    std::vector<int> actions;
+    const Node *current_node = leaf_node;
+    while (current_node != nullptr && current_node->parent_ != nullptr)
+    {
+        actions.push_back(current_node->action_taken_);
+        current_node = current_node->parent_;
+    }
+    std::reverse(actions.begin(), actions.end());
+
+    std::deque<BitboardState> full_history;
+    Gomoku temp_state = root_state; // 使用根状态的轻量级拷贝
+
+    // 2. 从根状态开始，重演所有动作，并记录路径上的每一步棋盘快照
+    for (int action : actions)
+    {
+        full_history.push_front(temp_state.get_bitboard_state());
+        temp_state.execute_move(action);
+    }
+
+    // 3. 将MCTS搜索开始前的历史（根历史）附加到路径历史之后
+    full_history.insert(full_history.end(), root_history.begin(), root_history.end());
+
+    // 4. 裁剪历史记录，确保其长度不超过 history_steps 的要求
+    while (full_history.size() > static_cast<size_t>(history_steps))
+    {
+        full_history.pop_back();
+    }
+
+    return full_history;
+}
+// =============================================================
 
 std::mutex g_io_mutex;
 std::atomic<long long> g_request_id_counter(0);
+std::atomic<long long> g_arena_full_count(0);
 
 // ====================== 【新增】狄利克雷噪声辅助函数 ======================
 // 在文件靠前的位置 (例如，在 g_io_mutex 定义后) 添加这个函数
 void add_dirichlet_noise(
-    std::vector<float>& policy,
-    const std::vector<bool>& valid_moves,
+    std::vector<float> &policy,
+    const std::vector<bool> &valid_moves,
     double alpha,
     double epsilon)
 {
@@ -48,13 +188,16 @@ void add_dirichlet_noise(
 
     // 统计有多少个合法走法
     int num_valid_moves = 0;
-    for (bool valid : valid_moves) {
-        if (valid) {
+    for (bool valid : valid_moves)
+    {
+        if (valid)
+        {
             num_valid_moves++;
         }
     }
     // 如果合法走法少于2个，添加噪声没有意义
-    if (num_valid_moves <= 1) return;
+    if (num_valid_moves <= 1)
+        return;
 
     // 为每个合法走法从伽马分布中采样一个值
     std::vector<float> noise_values;
@@ -62,8 +205,10 @@ void add_dirichlet_noise(
     std::gamma_distribution<float> gamma(alpha, 1.0f);
     float sum_of_noise = 0.0f;
 
-    for (size_t i = 0; i < valid_moves.size(); ++i) {
-        if (valid_moves[i]) {
+    for (size_t i = 0; i < valid_moves.size(); ++i)
+    {
+        if (valid_moves[i])
+        {
             float noise = gamma(generator);
             noise_values.push_back(noise);
             sum_of_noise += noise;
@@ -71,16 +216,20 @@ void add_dirichlet_noise(
     }
 
     // 归一化伽马分布的采样值，得到最终的狄利克雷噪声
-    if (sum_of_noise > 0.0f) {
-        for (float& n : noise_values) {
+    if (sum_of_noise > 0.0f)
+    {
+        for (float &n : noise_values)
+        {
             n /= sum_of_noise;
         }
     }
 
     // 将噪声混合进原始策略中
     int noise_idx = 0;
-    for (size_t i = 0; i < policy.size(); ++i) {
-        if (valid_moves[i]) {
+    for (size_t i = 0; i < policy.size(); ++i)
+    {
+        if (valid_moves[i])
+        {
             policy[i] = (1.0f - epsilon) * policy[i] + epsilon * noise_values[noise_idx];
             noise_idx++;
         }
@@ -88,127 +237,610 @@ void add_dirichlet_noise(
 }
 // ===========================================================================
 
-// ====================== 新增：活二威胁检测启发函数 ======================
-void apply_threat_detection_bias(
-    std::vector<float>& policy,
-    const Gomoku& game_state,
-    float bonus_strength)
+// file: cpp_src/SelfPlayManager.cpp
+
+// ====================== 领地内落子惩罚函数 (最终版) ======================
+void apply_territory_penalty(
+    std::vector<float> &policy,
+    const Gomoku &game_state,
+    float penalty_strength)
 {
+    // 获取当前玩家的领地位棋盘
+    const uint64_t *player_territory = game_state.get_player_territory_bitboard();
     const int board_size = game_state.get_board_size();
-    const int player = game_state.get_current_player();
-    auto valid_moves = game_state.get_valid_moves();
 
-    std::vector<int> threat_moves;
+    // 遍历棋盘上的每一个点
+    for (int action = 0; action < board_size * board_size; ++action)
+    {
+        const int index = action / 64;
+        const uint64_t mask = 1ULL << (action % 64);
 
-    for (int action = 0; action < board_size * board_size; ++action) {
-        if (!valid_moves[action]) continue;
-
-        Gomoku next_state = game_state;
-        next_state.execute_move(action);
-
-        // 在新状态下，检查对手是否已经输了 (因为我们的落子可能直接形成三连)
-        // 这个检查很简单，如果对手没有合法落子点，说明我们赢了
-        if (std::none_of(next_state.get_valid_moves().begin(), next_state.get_valid_moves().end(), [](bool v){ return v; })) {
-             threat_moves.push_back(action);
-             continue;
+        // 检查这个点是否已经是当前玩家的领地
+        if ((player_territory[index] & mask) != 0)
+        {
+            // 如果是，直接将此处的策略概率乘以一个惩罚系数
+            // penalty_strength=0.5 意味着将此处的概率减半
+            // penalty_strength=1.0 意味着将此处概率降为0
+            policy[action] *= (1.0f - penalty_strength);
         }
     }
 
-    if (!threat_moves.empty()) {
-        float total_policy = 0.0f;
-        // 给所有识别出的威胁点加上巨大的奖励
-        for (int move : threat_moves) {
-            policy[move] += bonus_strength;
+    // 重新归一化策略概率，确保总和为1
+    float policy_sum = 0.0f;
+    for (float p : policy)
+    {
+        // 确保不加负数
+        if (p > 0)
+            policy_sum += p;
+    }
+    if (policy_sum > 0.0f)
+    {
+        for (float &p : policy)
+        {
+            if (p > 0)
+                p /= policy_sum;
         }
-        // 重新归一化
-        for(float p : policy) {
-            if (p > 0) total_policy += p;
-        }
-        if (total_policy > 0) {
-            for (float& p : policy) {
-                if (p > 0) p /= total_policy;
+    }
+}
+
+// ====================== 新增：无效连接惩罚函数 ======================
+void apply_ineffective_connection_penalty(
+    std::vector<float> &policy,
+    const Gomoku &game_state,
+    float penalty_factor)
+{
+    const int board_size = game_state.get_board_size();
+    auto valid_moves = game_state.get_valid_moves();
+    const int current_player_id = game_state.get_current_player();
+
+    // 1. 获取当前玩家在落子前的领地分数
+    auto scores_before = game_state.calculate_scores();
+    int player_score_before = scores_before.at(current_player_id);
+
+    // 2. 遍历所有可能的合法走法
+    for (int action = 0; action < board_size * board_size; ++action)
+    {
+        // 只检查有一定概率的合法走法，避免无效计算
+        if (valid_moves[action] && policy[action] > 1e-6)
+        {
+            // 3. 在一个临时副本上模拟落子
+            Gomoku next_state = game_state;
+            next_state.execute_move(action);
+
+            // 4. 检查是否发生了“自提”：我们刚下的棋子是否消失了？
+            int r = action / board_size;
+            int c = action % board_size;
+            if (!next_state.is_occupied(r, c))
+            {
+                // 5. 如果发生自提，计算领地收益
+                auto scores_after = next_state.calculate_scores();
+                // 注意：execute_move后玩家会切换，但我们仍要计算原玩家的分数
+                int player_score_after = scores_after.at(current_player_id);
+                int territory_gain = player_score_after - player_score_before;
+
+                // 6. 如果没有任何领地收益，则施加惩罚
+                if (territory_gain <= 0)
+                {
+                    policy[action] *= penalty_factor;
+                }
             }
+        }
+    }
+
+    // 7. 重新归一化策略，确保总和为1
+    float policy_sum = 0.0f;
+    for (float p : policy)
+    {
+        if (p > 0)
+            policy_sum += p;
+    }
+    if (policy_sum > 0.0f)
+    {
+        for (float &p : policy)
+        {
+            if (p > 0)
+                p /= policy_sum;
         }
     }
 }
 // =======================================================================
+//威胁评估奖励
+void apply_opponent_territory_gain_bonus(
+    std::vector<float>& policy,
+    const Gomoku& game_state,
+    float bonus_strength
+) {
+    if (bonus_strength <= 0.0f) {
+        return; // 如果奖励强度为0或负数，则不执行任何操作
+    }
+
+    const int board_size = game_state.get_board_size();
+    auto valid_moves = game_state.get_valid_moves();
+    std::vector<float> bonuses(board_size * board_size, 0.0f);
+    float max_bonus_value = 0.0f;
+
+    // 第一遍：计算所有合法防守点的“领地防守价值”，并找到最大值
+    for (int action = 0; action < board_size * board_size; ++action) {
+        if (valid_moves[action]) {
+            int territory_gain_prevented = game_state.check_opponent_threat(action);
+            if (territory_gain_prevented > 0) {
+                bonuses[action] = static_cast<float>(territory_gain_prevented);
+                if (bonuses[action] > max_bonus_value) {
+                    max_bonus_value = bonuses[action];
+                }
+            }
+        }
+    }
+
+    // 第二遍：如果存在有价值的防守点，则将奖励施加到策略上
+    if (max_bonus_value > 0) {
+        for (int action = 0; action < board_size * board_size; ++action) {
+            if (bonuses[action] > 0) {
+                // 将奖励值进行归一化（使其在0-1之间），这样可以避免某个过大的收益值完全主导策略。
+                // 然后乘以奖励强度系数，施加到原始策略上。
+                float normalized_bonus = bonuses[action] / max_bonus_value;
+                policy[action] *= (1.0f + bonus_strength * normalized_bonus);
+            }
+        }
+    }
+
+    // 最后一遍：重新归一化整个策略向量，确保所有概率之和为1
+    float policy_sum = 0.0f;
+    for (float p : policy) {
+        if (p > 0) policy_sum += p;
+    }
+    if (policy_sum > 0.0f) {
+        for (float& p : policy) {
+            if (p > 0) p /= policy_sum;
+        }
+    }
+}
+
+// ==================== 新增：统一的MCTS核心函数 ====================
+
+// 定义一个枚举来区分不同的运行模式
+enum class MCTS_MODE
+{
+    SELF_PLAY, // 用于自对弈，启用噪声和温度采样
+    EVALUATION // 用于评估或人机对战，确定性的贪婪选择
+};
+
+// file: cpp_src/SelfPlayManager.cpp (文件中部)
+// vvvvvv 【核心修改】 vvvvvv
+std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
+    const Gomoku &root_state,
+    const std::deque<BitboardState> &history,
+    InferenceEngine &engine,
+    const MCTS_Config &config,
+    MCTS_MODE mode,
+    TrivialArena &node_arena,  // <-- 新增参数
+    TrivialArena &gomoku_arena // <-- 新增参数
+)
+{
+    // 竞技场和根节点初始化
+    auto root = std::make_unique<Node>(nullptr, -1, 1.0f);
+    // Arena arena(1024 * 1024 * 1024); // <-- 【重要】删除这一行！竞技场现在由外部传入
+
+    // 在使用前先重置竞技场，确保它们是干净的
+    node_arena.reset();
+    gomoku_arena.reset();
+    // ...
+    // ================== MCTS 主循环 (修正循环结构) ==================
+    for (int i = 0; i < config.num_simulations; i += config.mcts_batch_size)
+    {
+        std::vector<Node *> leaves_batch;
+        leaves_batch.reserve(config.mcts_batch_size);
+
+        // 1a. 收集叶子节点 (选择阶段)
+        for (int j = 0; j < config.mcts_batch_size && i + j < config.num_simulations; ++j)
+        {
+            Node *node = root.get();
+            node->virtual_loss_count_++; // 添加虚拟损失
+            while (node->is_fully_expanded())
+            {
+                node = node->select_child(config.c_puct);
+                node->virtual_loss_count_++;
+            }
+
+            // 检查叶子节点是否是终局状态
+            const Gomoku& current_node_state = get_or_reconstruct_state(node, root_state, gomoku_arena);
+            auto [end_value, is_terminal] = current_node_state.get_game_ended();
+
+            if (is_terminal)
+            {
+                // 如果是终局，直接反向传播结果，无需神经网络
+                Node *temp_node = node;
+                while (temp_node != nullptr)
+                {
+                    temp_node->virtual_loss_count_--; // 偿还虚拟损失
+                    temp_node = temp_node->parent_;
+                }
+                double value_to_propagate = end_value * current_node_state.get_current_player();
+                node->backpropagate(value_to_propagate);
+            }
+            else
+            {
+                // 如果不是终局，则加入批处理队列等待扩展
+                leaves_batch.push_back(node);
+            }
+        }
+
+        if (leaves_batch.empty())
+            continue;
+
+        // 1b. 准备输入并进行神经网络推理 (保持不变)
+        std::vector<std::vector<float>> state_batch;
+        state_batch.reserve(leaves_batch.size());
+        for (const auto *leaf : leaves_batch)
+        {
+            const Gomoku& leaf_state = get_or_reconstruct_state(leaf, root_state, gomoku_arena);
+            std::deque<BitboardState> leaf_history = gather_history_for_leaf(
+                leaf, root_state, history, config.history_steps);
+            state_batch.push_back(leaf_state.get_state(leaf_history));
+        }
+        auto [policy_batch, value_batch] = engine.infer(state_batch, root_state.get_board_size(), config.num_channels);
+
+        // ================== 1c. 扩展和反向传播 (结构优化版) ==================
+        for (size_t k = 0; k < leaves_batch.size(); ++k)
+        {
+            Node *leaf = leaves_batch[k];
+            auto current_policy = policy_batch[k];
+            // 【必须保留】从批处理结果中获取神经网络的价值预测
+            double nn_value = static_cast<double>(value_batch[k]);
+            // 【应用修改】使用新的、带缓存的函数获取状态
+            const Gomoku& leaf_state_for_expansion = get_or_reconstruct_state(leaf, root_state, gomoku_arena);
+
+            // ... 后续的启发式策略、扩展和反向传播逻辑 ...
+            // --- 根节点专属逻辑区 ---
+            // 所有只在根节点应用的启发式策略都集中于此
+            if (leaf == root.get())
+            {
+                // Part 1: 仅在“训练(自对弈)”模式下生效的探索性策略
+                if (mode == MCTS_MODE::SELF_PLAY)
+                {
+                    // 开局偏置
+                    if (config.enable_opening_bias && leaf_state_for_expansion.get_move_number() < 50)
+                    {
+                        const int board_size = leaf_state_for_expansion.get_board_size();
+                        float bias_strength = config.opening_bias_strength;
+                        std::vector<float> opening_bias(board_size * board_size, 0.0f);
+                        for (int r = 0; r < board_size; ++r)
+                        {
+                            for (int c = 0; c < board_size; ++c)
+                            {
+                                int dist_from_edge = std::min({r, c, board_size - 1 - r, board_size - 1 - c});
+                                float bias = 0.0f;
+                                if (dist_from_edge == 0)
+                                    bias = 0.1f;
+                                else if (dist_from_edge == 1)
+                                    bias = 0.4f;
+                                else if (dist_from_edge == 2)
+                                    bias = 0.8f;
+                                else
+                                    bias = 1.0f;
+                                opening_bias[r * board_size + c] = bias;
+                            }
+                        }
+                        float policy_sum = 0.0f;
+                        for (size_t pol_i = 0; pol_i < current_policy.size(); ++pol_i)
+                        {
+                            current_policy[pol_i] += bias_strength * opening_bias[pol_i];
+                            policy_sum += current_policy[pol_i];
+                        }
+                        if (policy_sum > 0.0f)
+                        {
+                            for (size_t pol_i = 0; pol_i < current_policy.size(); ++pol_i)
+                            {
+                                current_policy[pol_i] /= policy_sum;
+                            }
+                        }
+                    }
+                    // 狄利克雷噪声
+                    add_dirichlet_noise(current_policy, leaf_state_for_expansion.get_valid_moves(),
+                                        config.dirichlet_alpha, config.dirichlet_epsilon);
+                }
+
+                // Part 2: 在“所有模式”下对根节点生效的策略惩罚
+                // (新位置) 领地维持惩罚
+                if (config.enable_territory_penalty)
+                {
+                    apply_territory_penalty(current_policy, leaf_state_for_expansion, config.territory_penalty_strength);
+                }
+
+                // ★★★ 新增调用点：在这里应用新的惩罚函数 ★★★
+                // 这个位置确保了它在训练、评估、对战时都生效
+                if (config.enable_ineffective_connection_penalty)
+                {
+                    apply_ineffective_connection_penalty(current_policy, leaf_state_for_expansion, config.ineffective_connection_penalty_factor);
+                }
+
+                
+                if (config.enable_opponent_territory_threat_bonus) 
+                {
+                    apply_opponent_territory_gain_bonus(
+                        current_policy,
+                        leaf_state_for_expansion,
+                        config.opponent_territory_threat_bonus_strength // 使用新的配置名
+                    );// 使用新的配置名
+                 
+                }
+
+
+
+            }
+
+            // --- 通用逻辑区 ---
+            // 以下逻辑对所有叶子节点（包括根节点）生效
+
+            // 步骤 1: 扩展子节点
+            const auto valid_moves = leaf_state_for_expansion.get_valid_moves();
+            for (size_t action = 0; action < current_policy.size(); ++action)
+            {
+                if (current_policy[action] > 0.0f && valid_moves[action])
+                {
+                    try
+                    {
+                        // vvvvvv 【核心修正】 vvvvvv
+                        // 使用传入的 node_arena 来分配 Node 对象
+                        Node *child_node = new (node_arena.allocate<Node>()) Node(leaf, action, current_policy[action]);
+                        // ^^^^^^ 【核心修正】 ^^^^^^
+                        leaf->children_.push_back(child_node);
+                    }
+                    catch (const std::bad_alloc &)
+                    {
+                        g_arena_full_count++;
+                        break;
+                    }
+                }
+            }
+
+            // 步骤 2: 计算最终价值并反向传播
+            double final_value = nn_value; // 默认最终价值等于神经网络的输出
+
+            // (新位置) 仅在根节点处，用领地启发来修正价值
+            if (leaf == root.get() && config.enable_territory_heuristic)
+            {
+                double territory_score = static_cast<double>(leaf_state_for_expansion.get_territory_score());
+                double heuristic_value = territory_score / (root_state.get_board_size() * root_state.get_board_size());
+                final_value = (1.0 - config.territory_heuristic_weight) * nn_value + config.territory_heuristic_weight * heuristic_value;
+            }
+
+            leaf->backpropagate(final_value);
+        }
+    } // ================== MCTS 主循环结束 ==================
+
+    // ================== 【修正点 4】: 在所有模拟完成后，再计算最终策略并返回 ==================
+    int action = -1;
+    std::vector<float> action_probs(root_state.get_board_size() * root_state.get_board_size(), 0.0f);
+
+    if (!root->children_.empty())
+    {
+        float sum_visits = 0;
+        for (const auto &child : root->children_)
+        {
+            if (child)
+                sum_visits += child->visit_count_;
+        }
+        if (sum_visits > 0)
+        {
+            for (const auto &child : root->children_)
+            {
+                if (child)
+                    action_probs[child->action_taken_] = static_cast<float>(child->visit_count_) / sum_visits;
+            }
+        }
+    }
+
+    // 根据模式选择最终动作 (温度采样或贪心选择)
+    double temperature = 0.0;
+    if (mode == MCTS_MODE::SELF_PLAY)
+    {
+        temperature = (root_state.get_move_number() < config.temperature_decay_moves)
+                          ? config.temperature_start
+                          : config.temperature_end;
+    }
+
+    if (temperature > 0.01 && !root->children_.empty())
+    {
+        // 温度采样
+        std::vector<double> powered_visits;
+        std::vector<int> actions;
+        for (const auto &child : root->children_)
+        {
+            if (child)
+            {
+                powered_visits.push_back(std::pow(static_cast<double>(child->visit_count_), 1.0 / temperature));
+                actions.push_back(child->action_taken_);
+            }
+        }
+        if (!actions.empty())
+        {
+            static thread_local std::mt19937 generator(std::random_device{}());
+            std::discrete_distribution<int> dist(powered_visits.begin(), powered_visits.end());
+            action = actions[dist(generator)];
+        }
+    }
+    else if (!root->children_.empty())
+    {
+        // 贪婪选择
+        int max_visits = -1;
+        std::vector<int> best_actions;
+        for (const auto &child : root->children_)
+        {
+            if (child && child->visit_count_ > max_visits)
+            {
+                max_visits = child->visit_count_;
+                best_actions.clear();
+                best_actions.push_back(child->action_taken_);
+            }
+            else if (child && child->visit_count_ == max_visits)
+            {
+                best_actions.push_back(child->action_taken_);
+            }
+        }
+        if (!best_actions.empty())
+        {
+            static thread_local std::mt19937 generator(std::random_device{}());
+            std::uniform_int_distribution<size_t> dist(0, best_actions.size() - 1);
+            action = best_actions[dist(generator)];
+        }
+    }
+
+    // 如果没选出动作 (例如，根节点是终局)，随机选择一个合法动作
+    if (action == -1)
+    {
+        auto valid_moves = root_state.get_valid_moves();
+        std::vector<int> valid_move_indices;
+        for (size_t i = 0; i < valid_moves.size(); ++i)
+        {
+            if (valid_moves[i])
+                valid_move_indices.push_back(i);
+        }
+        if (!valid_move_indices.empty())
+        {
+            std::uniform_int_distribution<> distrib(0, valid_move_indices.size() - 1);
+            static thread_local std::mt19937 generator(std::random_device{}());
+            action = valid_move_indices[distrib(generator)];
+        }
+    }
+
+    // --- 新增：强制最终归一化，确保总和为1 ---
+    float final_policy_sum = 0.0f;
+    for (float p : action_probs)
+    {
+        final_policy_sum += p;
+    }
+
+    // 只有在总和大于0时才进行除法，避免除以零的错误
+    if (final_policy_sum > 1e-6)
+    { // 使用一个小的阈值以应对浮点数精度问题
+        for (float &p : action_probs)
+        {
+            p /= final_policy_sum;
+        }
+    }
+    // --- 修正结束 ---
+    double mcts_value = 0.0;
+    if (root->visit_count_ > 0) {
+        // root是Node*类型，指向MCTS的根节点
+        mcts_value = root->value_sum_ / root->visit_count_;
+    }
+
+    return {action, action_probs, mcts_value};
+}
+
+// =============================================================
 
 // Python调用的顶层函数
-void run_parallel_self_play(const std::string& model_path, bool use_gpu, py::object final_data_queue, py::dict args) {
+void run_parallel_self_play(const std::string &model_path, bool use_gpu, py::object final_data_queue, py::dict args)
+{
     auto engine = std::make_shared<InferenceEngine>(model_path, use_gpu);
     auto manager = std::make_shared<SelfPlayManager>(engine, final_data_queue, args);
 
-    std::thread cpp_manager_thread([manager]() {
-        manager->run();
-    });
+    std::thread cpp_manager_thread([manager]()
+                                   { manager->run(); });
 
     {
         py::gil_scoped_release release;
-        if (cpp_manager_thread.joinable()) {
+        if (cpp_manager_thread.joinable())
+        {
             cpp_manager_thread.join();
         }
     }
 }
 
-// ====================== 核心修正区域：构造函数 ======================
-// 在构造函数中，从Python字典中提取所需参数并用C++成员变量存储
 SelfPlayManager::SelfPlayManager(std::shared_ptr<InferenceEngine> engine, py::object final_data_queue, py::dict args)
-    : engine_(engine), final_data_queue_(final_data_queue) {
-
+    : engine_(engine), final_data_queue_(final_data_queue)
+{
     this->num_total_games_ = args["num_selfPlay_episodes"].cast<int>();
     this->num_workers_ = args["num_cpu_threads"].cast<int>();
-    this->num_simulations_ = args["num_searches"].cast<int>();
-    this->dirichlet_alpha_ = args["dirichlet_alpha"].cast<double>();
-        this->dirichlet_epsilon_ = args["dirichlet_epsilon"].cast<double>();
-         // 【新增】从Python字典中获取温度参数
-            this->temperature_start_ = args["temperature_start"].cast<double>();
-            this->temperature_end_ = args["temperature_end"].cast<double>();
-            this->temperature_decay_moves_ = args["temperature_decay_moves"].cast<int>();
-            this->mcts_batch_size_ = args["mcts_batch_size"].cast<int>();
-             this->enable_opening_bias_ = args["enable_opening_bias"].cast<bool>();
-                this->opening_bias_strength_ = args["opening_bias_strength"].cast<float>();
-                this->enable_threat_detection_ = args["enable_threat_detection"].cast<bool>();
-                this->threat_detection_bonus_ = args["threat_detection_bonus"].cast<float>();
-                this->enable_territory_heuristic_ = args["enable_territory_heuristic"].cast<bool>();
-                this->territory_heuristic_weight_ = args["territory_heuristic_weight"].cast<double>();
-                this->board_size_ = args.contains("board_size") ? args["board_size"].cast<int>() : 9;
-                    this->num_rounds_ = args.contains("num_rounds") ? args["num_rounds"].cast<int>() : 25;
-                    this->history_steps_ = args.contains("history_steps") ? args["history_steps"].cast<int>() : 0;
-                    this->num_channels_ = args["num_channels"].cast<int>();
-                    this->c_puct_ = args["C"].cast<double>();
+    this->board_size_ = args["board_size"].cast<int>();
+    this->num_rounds_ = args["num_rounds"].cast<int>();
+
+    // 直接填充MCTS配置结构体
+    this->mcts_config_.num_simulations = args["num_searches"].cast<int>();
+    this->mcts_config_.mcts_batch_size = args["mcts_batch_size"].cast<int>();
+    this->mcts_config_.c_puct = args["C"].cast<double>();
+    this->mcts_config_.history_steps = args["history_steps"].cast<int>();
+    this->mcts_config_.num_channels = args["num_channels"].cast<int>();
+    this->mcts_config_.enable_opening_bias = args["enable_opening_bias"].cast<bool>();
+    this->mcts_config_.opening_bias_strength = args["opening_bias_strength"].cast<float>();
+    this->mcts_config_.enable_ineffective_connection_penalty = args["enable_ineffective_connection_penalty"].cast<bool>();
+    this->mcts_config_.ineffective_connection_penalty_factor = args["ineffective_connection_penalty_factor"].cast<float>();
+    this->mcts_config_.enable_territory_heuristic = args["enable_territory_heuristic"].cast<bool>();
+    this->mcts_config_.territory_heuristic_weight = args["territory_heuristic_weight"].cast<double>();
+    this->mcts_config_.dirichlet_alpha = args["dirichlet_alpha"].cast<double>();
+    this->mcts_config_.dirichlet_epsilon = args["dirichlet_epsilon"].cast<double>();
+    this->mcts_config_.temperature_start = args["temperature_start"].cast<double>();
+    this->mcts_config_.temperature_end = args["temperature_end"].cast<double>();
+    this->mcts_config_.temperature_decay_moves = args["temperature_decay_moves"].cast<int>();
+    this->mcts_config_.enable_territory_penalty = args.contains("enable_territory_penalty") ? args["enable_territory_penalty"].cast<bool>() : false;
+    this->mcts_config_.territory_penalty_strength = args.contains("territory_penalty_strength") ? args["territory_penalty_strength"].cast<float>() : 0.0f;
+    this->mcts_config_.enable_opponent_territory_threat_bonus = args.contains("enable_opponent_territory_threat_bonus") ? args["enable_opponent_territory_threat_bonus"].cast<bool>() : false;
+    this->mcts_config_.opponent_territory_threat_bonus_strength = args.contains("opponent_territory_threat_bonus_strength") ? args["opponent_territory_threat_bonus_strength"].cast<float>() : 1.5f;
 }
-// ===============================================================
+// file: cpp_src/SelfPlayManager.cpp
+// 找到 SelfPlayManager::collector_func 函数，并用下面的完整版本替换它
 
-// ==================== 新增：搬运工线程的完整实现 ====================
-void SelfPlayManager::collector_func() {
-    while (completed_games_count_ < num_total_games_) {
+void SelfPlayManager::collector_func()
+{
+    // 主循环：在游戏还在进行时，持续搬运数据
+    while (completed_games_count_ < num_total_games_)
+    {
         TrainingDataPacket packet;
-        if (data_collector_queue_.try_pop(packet)) {
+        if (data_collector_queue_.try_pop(packet))
+        {
             // 成功从中转站取出数据包
-            // 现在，只有这个线程需要获取GIL来与Python交互
+            // 这部分逻辑保持不变
             py::gil_scoped_acquire acquire;
-
             py::list training_examples_list;
-            for (const auto& ex : packet) {
+            for (const auto &ex : packet)
+            {
                 training_examples_list.append(py::make_tuple(
                     py::cast(std::get<0>(ex)),
                     py::cast(std::get<1>(ex)),
-                    py::cast(std::get<2>(ex))
-                ));
+                    py::cast(std::get<2>(ex))));
             }
             py::dict data_to_send;
             data_to_send["type"] = "data";
             data_to_send["data"] = training_examples_list;
             final_data_queue_.attr("put")(data_to_send);
-        } else {
+        }
+        else
+        {
             // 中转站暂时为空，短暂休眠一下，避免空转浪费CPU
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
+
+    // ====================== 【新增的收尾工作】 ======================
+    // 主循环退出后（所有游戏都已完成），为防止有数据在竞态中被遗漏，
+    // 我们需要在这里彻底清空一次队列。
+    TrainingDataPacket packet;
+    while (data_collector_queue_.try_pop(packet))
+    {
+        // 这里的逻辑和主循环中完全一样，确保最后的数据也被处理
+        py::gil_scoped_acquire acquire;
+        py::list training_examples_list;
+        for (const auto &ex : packet)
+        {
+            training_examples_list.append(py::make_tuple(
+                py::cast(std::get<0>(ex)),
+                py::cast(std::get<1>(ex)),
+                py::cast(std::get<2>(ex))));
+        }
+        py::dict data_to_send;
+        data_to_send["type"] = "data";
+        data_to_send["data"] = training_examples_list;
+        final_data_queue_.attr("put")(data_to_send);
+    }
+    // ==============================================================
 }
 
-void SelfPlayManager::run() {
-    for (int i = 0; i < this->num_total_games_; ++i) {
+void SelfPlayManager::run()
+{
+    for (int i = 0; i < this->num_total_games_; ++i)
+    {
         task_queue_.push(i);
     }
 
@@ -218,301 +850,122 @@ void SelfPlayManager::run() {
     }
 
     // ==================== 新增：启动搬运工线程 ====================
-        collector_thread_ = std::thread(&SelfPlayManager::collector_func, this);
+    collector_thread_ = std::thread(&SelfPlayManager::collector_func, this);
 
     threads_.reserve(this->num_workers_);
-    for (int i = 0; i < this->num_workers_; ++i) {
+    for (int i = 0; i < this->num_workers_; ++i)
+    {
         threads_.emplace_back(&SelfPlayManager::worker_func, this, i);
     }
 
-    for (auto& t : threads_) {
-        if (t.joinable()) {
+    for (auto &t : threads_)
+    {
+        if (t.joinable())
+        {
             t.join();
         }
     }
 
     // ==================== 新增：等待搬运工线程结束 ====================
-        if (collector_thread_.joinable()) {
-            collector_thread_.join();
-        }
+    if (collector_thread_.joinable())
+    {
+        collector_thread_.join();
+    }
 
     {
         std::lock_guard<std::mutex> lock(g_io_mutex);
         std::cout << "[C++ Manager] All self-play games finished." << std::endl;
+        // 打印Arena耗尽的总次数
+        std::cout << "[C++ Manager] Arena was exhausted " << g_arena_full_count.load() << " times." << std::endl;
+        g_arena_full_count = 0; // 重置以便下次迭代
     }
 }
 
-// ====================== 最终版工作函数 (包含正确的MCTS和所有原有功能) ======================
-void SelfPlayManager::worker_func(int worker_id) {
-    while (true) {
+// 文件: cpp_src/SelfPlayManager.cpp
+// 这是包含了您指出的 action_size 初始化代码的最终修正版
+
+void SelfPlayManager::worker_func(int worker_id)
+{
+    while (true)
+    {
         int game_idx;
-        if (!task_queue_.try_pop(game_idx)) {
+        if (!task_queue_.try_pop(game_idx))
+        {
             break; // 任务队列空，线程退出
         }
 
-        try {
-            Gomoku game(this->board_size_, this->num_rounds_, this->history_steps_);
-            std::vector<std::tuple<std::vector<float>, std::vector<float>, int>> episode_data;
+        try
+        {
+            TrivialArena node_arena(1024 * 1024 * 1024);  // 100MB 给 Node
+            TrivialArena gomoku_arena(256 * 1024 * 1024); // 32MB 给 Gomoku 缓存
+            Gomoku game(this->board_size_, this->num_rounds_, this->mcts_config_.history_steps);
+            std::deque<BitboardState> game_history;
+            std::vector<std::tuple<std::vector<float>, std::vector<float>, double>> episode_data;
+
+            // 【已加回】根据您的反馈，保留 action_size 的初始化
             const int action_size = game.get_board_size() * game.get_board_size();
 
-            // ====================== 单局游戏主循环 ======================
-            while (true) {
-                auto initial_state_ptr = std::make_shared<const Gomoku>(game);
-                auto root = std::make_unique<Node>(initial_state_ptr, nullptr, -1, 1.0f);
-
-                // === 1. 正确的MCTS批处理搜索 ===
-                const int num_simulations = this->num_simulations_;
-                const int batch_size = this->mcts_batch_size_;
-
-                for (int i = 0; i < num_simulations; i += batch_size) {
-                    std::vector<Node*> leaves_batch;
-                    leaves_batch.reserve(batch_size);
-                    std::vector<std::vector<float>> state_batch;
-                    state_batch.reserve(batch_size);
-
-                    // 1a. 收集一个批次的叶子节点
-                    for (int j = 0; j < batch_size && i + j < num_simulations; ++j) {
-                        Node* node = root.get();
-
-                        node->virtual_loss_count_++;
-
-                        while (node->is_fully_expanded()) {
-                            node = node->select_child(this->c_puct_);
-                            node->virtual_loss_count_++;
-                        }
-
-                        auto [end_value, is_terminal] = node->game_state_->get_game_ended();
-                        if (is_terminal) {
-                            Node* temp_node = node;
-                            while(temp_node != nullptr) {
-                                temp_node->virtual_loss_count_--;
-                                temp_node = temp_node->parent_;
-                            }
-                            double value_to_propagate = end_value * node->game_state_->get_current_player();
-                            node->backpropagate(value_to_propagate);
-                        } else {
-                            leaves_batch.push_back(node);
-                            state_batch.push_back(node->game_state_->get_state());
-                        }
-                    }
-
-                    if (leaves_batch.empty()) {
-                        continue;
-                    }
-
-                    // 1b. 对批次进行神经网络推理
-                    auto [policy_batch, value_batch] = engine_->infer(state_batch, this->board_size_, this->num_channels_);
-
-                    // 1c. 扩展和反向传播批次中的每一个叶子节点
-                    for (size_t k = 0; k < leaves_batch.size(); ++k) {
-                        Node* leaf = leaves_batch[k];
-                        auto current_policy = policy_batch[k];
-
-                        // ====================== 在此注入您的完整逻辑 ======================
-                        if (leaf->parent_ == nullptr) { // 只对根节点操作
-                            // --- 注入开局偏置 ---
-                            if (this->enable_opening_bias_ && leaf->game_state_->get_move_number() == 0) {
-                                const int board_size = leaf->game_state_->get_board_size();
-                                float bias_strength = this->opening_bias_strength_;
-                                std::vector<float> opening_bias(board_size * board_size, 0.0f);
-                                for (int r = 0; r < board_size; ++r) {
-                                    for (int c = 0; c < board_size; ++c) {
-                                        int dist_from_edge = std::min({r, c, board_size - 1 - r, board_size - 1 - c});
-                                        float bias = 0.0f;
-                                        if (dist_from_edge == 0) bias = 0.1f;
-                                        else if (dist_from_edge == 1) bias = 0.4f;
-                                        else if (dist_from_edge == 2) bias = 0.8f;
-                                        else bias = 1.0f;
-                                        opening_bias[r * board_size + c] = bias;
-                                    }
-                                }
-                                float policy_sum = 0.0f;
-                                for(size_t i = 0; i < current_policy.size(); ++i) {
-                                    current_policy[i] += bias_strength * opening_bias[i];
-                                    policy_sum += current_policy[i];
-                                }
-                                if (policy_sum > 0.0f) {
-                                    for(size_t i = 0; i < current_policy.size(); ++i) {
-                                        current_policy[i] /= policy_sum;
-                                    }
-                                }
-                            }
-
-                            // --- 调用威胁检测 ---
-                            if (this->enable_threat_detection_) {
-                                float bonus = this->threat_detection_bonus_;
-                                // 注意：apply_threat_detection_bias 需要一个Gomoku对象引用，所以我们用 * 解引用指针
-                                apply_threat_detection_bias(current_policy, *leaf->game_state_, bonus);
-                            }
-
-                            // --- 添加狄利克雷噪声 ---
-                            add_dirichlet_noise(
-                                current_policy,
-                                leaf->game_state_->get_valid_moves(), // 注意这里是 ->
-                                this->dirichlet_alpha_,
-                                this->dirichlet_epsilon_
-                            );
-                        }
-                        // ====================== 注入逻辑结束 ======================
-
-                        // 【统一的扩展逻辑】使用可能已被修改过的 current_policy 来创建子节点
-                        const auto& parent_state = *leaf->game_state_;
-                        const auto valid_moves = parent_state.get_valid_moves();
-                        leaf->children_.reserve(valid_moves.size());
-
-                        for (size_t action = 0; action < current_policy.size(); ++action) {
-                            if (current_policy[action] > 0.0f && valid_moves[action]) {
-                                auto next_game_state = std::make_shared<Gomoku>(parent_state);
-                                next_game_state->execute_move(action);
-                                leaf->children_.push_back(std::make_unique<Node>(
-                                    next_game_state, leaf, action, current_policy[action]
-                                ));
-                            }
-                        }
-                        // --- 修改开始: 混合价值启发 ---
-                            double nn_value = static_cast<double>(value_batch[k]);
-                            double final_value = nn_value;
-
-                            if (this->enable_territory_heuristic_) { // <--- 修改点
-                                double weight = this->territory_heuristic_weight_; // <--- 修改点
-                                const int board_size = leaf->game_state_->get_board_size();
-
-                                // 计算归一化的领地分数作为启发值 (-1.0 to 1.0)
-                                double territory_score = static_cast<double>(leaf->game_state_->get_territory_score());
-                                double heuristic_value = territory_score / (board_size * board_size);
-
-                                // 加权平均
-                                final_value = (1.0 - weight) * nn_value + weight * heuristic_value;
-                            }
-
-                            leaf->backpropagate(final_value);
-                            // --- 修改结束 ---
-                    }
-                }
-
-                // === 2. 计算用于训练的策略向量 ===
-                std::vector<float> action_probs(action_size, 0.0f);
-                if (!root->children_.empty()) {
-                    float sum_visits = 0;
-                    for (const auto& child : root->children_) {
-                        if (child) {
-                           sum_visits += child->visit_count_;
-                        }
-                    }
-                    // 归一化访问次数，得到策略概率
-                    if (sum_visits > 0) {
-                        for (const auto& child : root->children_) {
-                           if (child && child->action_taken_ >= 0 && child->action_taken_ < action_size) {
-                               action_probs[child->action_taken_] = static_cast<float>(child->visit_count_) / sum_visits;
-                           }
-                        }
-                    }
-                }
-
-                 // ==================== 验证日志 开始 ====================
-                                /*if (game.get_move_number() < 5) {
-                                    float policy_sum = std::accumulate(action_probs.begin(), action_probs.end(), 0.0f);
-                                    if (policy_sum < 0.0001f) {
-                                        std::lock_guard<std::mutex> lock(g_io_mutex);
-                                        std::cerr << "[VERIFICATION LOG] Game " << game_idx
-                                                  << ", Move " << game.get_move_number()
-                                                  << ": CRITICAL WARNING! Generated action_probs is still all zeros." << std::endl;
-                                    } else {
-                                        std::lock_guard<std::mutex> lock(g_io_mutex);
-                                        std::cout << "[VERIFICATION LOG] Game " << game_idx
-                                                  << ", Move " << game.get_move_number()
-                                                  << ": Policy generation is OK. Sum=" << policy_sum << std::endl;
-                                    }
-                                }*/
-                                // ==================== 验证日志 结束 ====================
-
-                episode_data.emplace_back(root->game_state_->get_state(), action_probs, game.get_current_player());
-
-                // === 3. ***保留功能点：温度采样和最终动作选择*** ===
-                int action = -1;
-                double current_temp = (game.get_move_number() < this->temperature_decay_moves_) ? this->temperature_start_ : this->temperature_end_;
-
-                if (current_temp > 0.01 && !root->children_.empty()) {
-                    // 温度高：按访问次数的幂次方进行概率采样，以增加探索
-                    std::vector<double> powered_visits;
-                    std::vector<int> actions;
-                    for (const auto& child : root->children_) {
-                        if (child) {
-                            powered_visits.push_back(std::pow(static_cast<double>(child->visit_count_), 1.0 / current_temp));
-                            actions.push_back(child->action_taken_);
-                        }
-                    }
-                    if (!actions.empty()) {
-                        static thread_local std::mt19937 generator(std::random_device{}());
-                        std::discrete_distribution<int> dist(powered_visits.begin(), powered_visits.end());
-                        action = actions[dist(generator)];
-                    }
-                // in SelfPlayManager::worker_func, inside the block for choosing an action
-
-                } else if (!root->children_.empty()) {
-                    // 温度低：贪婪选择，但随机化平局处理
-                    int max_visits = -1;
-                    for (const auto& child : root->children_) {
-                        if (child && child->visit_count_ > max_visits) {
-                            max_visits = child->visit_count_;
-                        }
-                    }
-
-                    std::vector<int> best_actions;
-                    for (const auto& child : root->children_) {
-                        if (child && child->visit_count_ == max_visits) {
-                            best_actions.push_back(child->action_taken_);
-                        }
-                    }
-
-                    if (!best_actions.empty()) {
-                        static thread_local std::mt19937 generator(std::random_device{}());
-                        std::uniform_int_distribution<size_t> dist(0, best_actions.size() - 1);
-                        action = best_actions[dist(generator)];
-                    }
-                }
-
-                // 如果由于某种原因没选出动作（例如MCTS后依然没有子节点），随机选择一个
-                if (action == -1) {
-                    auto valid_moves = game.get_valid_moves();
-                    std::vector<int> valid_move_indices;
-                    for (size_t i = 0; i < valid_moves.size(); ++i) {
-                        if (valid_moves[i]) valid_move_indices.push_back(i);
-                    }
-                    if (valid_move_indices.empty()) break; // 没有合法走法了，结束游戏
-                    std::uniform_int_distribution<> distrib(0, valid_move_indices.size() - 1);
-                    static thread_local std::mt19937 generator(std::random_device{}());
-                    action = valid_move_indices[distrib(generator)];
-                }
-
-                // === 4. 执行动作并为下一轮做准备 ===
-                game.execute_move(action);
-
-                // 游戏结束判断与数据处理
+            while (true)
+            {
+                // 1. 【先判断】游戏是否结束
                 auto [final_value, is_done] = game.get_game_ended();
-                if (is_done) {
-                    // ==================== 修改数据提交流程 开始 ====================
-                                        TrainingDataPacket cpp_training_examples; // 使用我们定义的新类型
-                                        cpp_training_examples.reserve(episode_data.size());
-                                        for (const auto& example : episode_data) {
-                                            double corrected_value = final_value * std::get<2>(example);
-                                            cpp_training_examples.emplace_back(std::get<0>(example), std::get<1>(example), corrected_value);
-                                        }
+                if (is_done)
+                {
+                    // 如果结束，整理并提交本局所有数据，然后跳出循环
+                    TrainingDataPacket cpp_training_examples;
+                    cpp_training_examples.reserve(episode_data.size());
+                    int current_player_at_end = game.get_current_player();
 
-                                        // 不再获取GIL，而是直接将C++数据包推入C++中转队列
-                                        data_collector_queue_.push(std::move(cpp_training_examples));
+                    for (auto it = episode_data.rbegin(); it != episode_data.rend(); ++it)
+                    {
+                        // 新逻辑：直接使用MCTS评估值
+                        // MCTS的价值是从当前玩家视角看的，所以轮到谁，价值就是谁的
+                        // 价值的符号在反向传播时已经处理好，这里直接使用即可
+                        double final_z = std::get<2>(*it);
 
-                                        // 原子地增加已完成游戏计数
-                                        completed_games_count_++;
+                        // 我们需要从后往前遍历，因为mcts_value是针对那个时刻的玩家的。
+                        // 训练时，价值z需要统一为根节点玩家（P1）的视角。
+                        // 在我们的框架中，价值网络总是预测当前玩家的胜率。
+                        // 而我们存储的mcts_value已经是当前玩家的视角，所以无需改变符号。
 
-                                        // ==================== 修改数据提交流程 结束 ====================
-                                        break;
+                        cpp_training_examples.emplace_back(std::get<0>(*it), std::get<1>(*it), final_z);
+                    }
+                    data_collector_queue_.push(std::move(cpp_training_examples));
+                    completed_games_count_++;
+                    break; // 结束本局游戏
                 }
+
+                // 2. 【后执行】如果游戏未结束，才为当前状态寻找最佳动作
+                const Gomoku root_state(game);
+                auto [action, action_probs, mcts_value] = find_best_action_by_mcts(
+                    root_state,
+                    game_history,
+                    *engine_,
+                    this->mcts_config_,
+                    MCTS_MODE::SELF_PLAY,
+                    node_arena,
+                    gomoku_arena
+                );
+
+                // 3. 存储【有效】的训练数据
+                episode_data.emplace_back(root_state.get_state(game_history), action_probs, mcts_value);
+
+                // 4. 更新历史记录并执行动作
+                game_history.push_front(game.get_bitboard_state());
+                if (game_history.size() > static_cast<size_t>(this->mcts_config_.history_steps))
+                {
+                    game_history.pop_back();
+                }
+                game.execute_move(action);
             }
-        } catch (const std::exception& e) {
+        }
+        catch (const std::exception &e)
+        {
             std::lock_guard<std::mutex> lock(g_io_mutex);
             std::cerr << "[C++ Worker " << worker_id << ", Game " << game_idx << "] Exception: " << e.what() << std::endl;
-        } catch (...) {
+        }
+        catch (...)
+        {
             std::lock_guard<std::mutex> lock(g_io_mutex);
             std::cerr << "[C++ Worker " << worker_id << ", Game " << game_idx << "] Unknown exception occurred!" << std::endl;
         }
@@ -522,19 +975,20 @@ void SelfPlayManager::worker_func(int worker_id) {
 // ====================== 新增：高效并行评估的完整实现 ======================
 
 // C++评估任务的顶层入口
-py::dict run_parallel_evaluation(const std::string& model1_path, const std::string& model2_path, bool use_gpu, py::dict args, int mode) { // <-- 增加mode参数
+py::dict run_parallel_evaluation(const std::string &model1_path, const std::string &model2_path, bool use_gpu, py::dict args, int mode)
+{ // <-- 增加mode参数
     auto engine1 = std::make_shared<InferenceEngine>(model1_path, use_gpu);
     auto engine2 = std::make_shared<InferenceEngine>(model2_path, use_gpu);
 
     auto eval_manager = std::make_shared<EvaluationManager>(engine1, engine2, args, mode); // <-- 将mode传给构造函数
 
-    std::thread cpp_eval_thread([eval_manager]() {
-        eval_manager->run();
-    });
+    std::thread cpp_eval_thread([eval_manager]()
+                                { eval_manager->run(); });
 
     {
         py::gil_scoped_release release;
-        if (cpp_eval_thread.joinable()) {
+        if (cpp_eval_thread.joinable())
+        {
             cpp_eval_thread.join();
         }
     }
@@ -542,7 +996,6 @@ py::dict run_parallel_evaluation(const std::string& model1_path, const std::stri
     return eval_manager->get_results();
 }
 
-// EvaluationManager 类的实现
 EvaluationManager::EvaluationManager(
     std::shared_ptr<InferenceEngine> engine1,
     std::shared_ptr<InferenceEngine> engine2,
@@ -550,27 +1003,46 @@ EvaluationManager::EvaluationManager(
     int mode)
     : engine1_(engine1), engine2_(engine2), evaluation_mode_(mode)
 {
-    num_total_games_ = args["num_eval_games"].cast<int>();
-    num_workers_ = args["num_cpu_threads"].cast<int>();
-    num_simulations_ = args["num_eval_simulations"].cast<int>();
+    // 非 MCTS 参数
+    this->num_total_games_ = args["num_eval_games"].cast<int>();
+    this->num_workers_ = args["num_cpu_threads"].cast<int>();
+    this->board_size_ = args["board_size"].cast<int>();
+    this->num_rounds_ = args["num_rounds"].cast<int>();
 
-    // 直接从 args 读取，因为我们已在 Python 端确保了它们的传递
-    board_size_ = args["board_size"].cast<int>();
-    num_rounds_ = args["num_rounds"].cast<int>();
-    num_channels_ = args["num_channels"].cast<int>();
-    c_puct_ = args["C"].cast<double>();
+    // 直接填充 MCTS 配置结构体
+    // 注意：评估使用的是 num_eval_simulations
+    this->mcts_config_.num_simulations = args["num_eval_simulations"].cast<int>();
+    this->mcts_config_.c_puct = args["C"].cast<double>();
+    this->mcts_config_.mcts_batch_size = args["mcts_batch_size"].cast<int>();
+    this->mcts_config_.history_steps = args["history_steps"].cast<int>();
+    this->mcts_config_.num_channels = args["num_channels"].cast<int>();
+    this->mcts_config_.enable_territory_penalty = args.contains("enable_territory_penalty") ? args["enable_territory_penalty"].cast<bool>() : false;
+    this->mcts_config_.territory_penalty_strength = args.contains("territory_penalty_strength") ? args["territory_penalty_strength"].cast<float>() : 0.0f;
 
-    // vvvvvvvv 这是最关键的新增行 vvvvvvvv
-    history_steps_ = args["history_steps"].cast<int>();
-    // ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    // 评估模式下，以下参数不起作用，但为保持结构完整性，我们仍进行初始化
+    this->mcts_config_.enable_opening_bias = false;
+    this->mcts_config_.opening_bias_strength = 0.0f;
+    this->mcts_config_.enable_ineffective_connection_penalty = args.contains("enable_ineffective_connection_penalty") ? args["enable_ineffective_connection_penalty"].cast<bool>() : false;
+    this->mcts_config_.ineffective_connection_penalty_factor = args.contains("ineffective_connection_penalty_factor") ? args["ineffective_connection_penalty_factor"].cast<float>() : 0.0f;
+    // 从Python的args字典中动态读取领地启发参数
+    this->mcts_config_.enable_territory_heuristic = args.contains("enable_territory_heuristic") ? args["enable_territory_heuristic"].cast<bool>() : false;
+    this->mcts_config_.territory_heuristic_weight = args.contains("territory_heuristic_weight") ? args["territory_heuristic_weight"].cast<double>() : 0.0;
+    this->mcts_config_.dirichlet_alpha = 0.0;
+    this->mcts_config_.dirichlet_epsilon = 0.0;
+    this->mcts_config_.temperature_start = 0.0;
+    this->mcts_config_.temperature_end = 0.0;
+    this->mcts_config_.temperature_decay_moves = 0;
 
-    // 初始化计分板
-    scores_[1] = 0;
-    scores_[-1] = 0;
-    scores_[0] = 0;
+    this->mcts_config_.enable_opponent_territory_threat_bonus = args.contains("enable_opponent_territory_threat_bonus") ? args["enable_opponent_territory_threat_bonus"].cast<bool>() : false;
+    this->mcts_config_.opponent_territory_threat_bonus_strength = args.contains("opponent_territory_threat_bonus_strength") ? args["opponent_territory_threat_bonus_strength"].cast<float>() : 1.5f;
+
+    this->scores_[1] = 0;  // 为"模型1胜利"初始化
+    this->scores_[-1] = 0; // 为"模型2胜利"初始化
+    this->scores_[0] = 0;  // 为"平局"初始化
 }
 
-py::dict EvaluationManager::get_results() const {
+py::dict EvaluationManager::get_results() const
+{
     py::dict results;
     results["model1_wins"] = scores_.at(1);
     results["model2_wins"] = scores_.at(-1);
@@ -578,352 +1050,277 @@ py::dict EvaluationManager::get_results() const {
     return results;
 }
 
-void EvaluationManager::run() {
-    for (int i = 0; i < num_total_games_; ++i) {
+void EvaluationManager::run()
+{
+    for (int i = 0; i < num_total_games_; ++i)
+    {
         task_queue_.push(i);
     }
     threads_.reserve(num_workers_);
-    for (int i = 0; i < num_workers_; ++i) {
+    for (int i = 0; i < num_workers_; ++i)
+    {
         threads_.emplace_back(&EvaluationManager::worker_func, this, i);
     }
-    for (auto& t : threads_) {
-        if (t.joinable()) t.join();
+    for (auto &t : threads_)
+    {
+        if (t.joinable())
+            t.join();
     }
 }
 
 // 评估工作线程，核心逻辑在此
-void EvaluationManager::worker_func(int worker_id) {
-    while (true) {
+
+void EvaluationManager::worker_func(int worker_id)
+{
+    while (true)
+    {
         int game_idx;
-        if (!task_queue_.try_pop(game_idx)) {
+        if (!task_queue_.try_pop(game_idx))
+        {
             break;
         }
 
-        try {
-                    Gomoku game(this->board_size_, this->num_rounds_, this->history_steps_);
-                            // ====================== 核心逻辑修改 ======================
-                                    auto& p1_engine = engine1_; // Model 1 默认执黑 (Player 1)
-                                    auto& p2_engine = engine2_; // Model 2 默认执白 (Player 2)
+        try
+        {
+            // ... 在 EvaluationManager::worker_func 的 try 块内部 ...
+            TrivialArena node_arena(1024 * 1024 * 1024);
+            TrivialArena gomoku_arena(256 * 1024 * 1024);
+            Gomoku game(this->board_size_, this->num_rounds_, this->mcts_config_.history_steps);
+            std::deque<BitboardState> game_history;
 
-                                    if (evaluation_mode_ == 0) { // Mode 0: 交替先后手
-                                        bool swap_models = (game_idx % 2 != 0);
-                                        if(swap_models) {
-                                            p1_engine = engine2_;
-                                            p2_engine = engine1_;
-                                        }
-                                    } else if (evaluation_mode_ == 1) { // Mode 1: 固定 Model 1 先手
-                                        // 不需要做任何事，p1_engine已经是engine1_
-                                    } else if (evaluation_mode_ == 2) { // Mode 2: 固定 Model 2 先手
-                                        p1_engine = engine2_;
-                                        p2_engine = engine1_;
-                                    }
-                                    // ========================================================
+            // vvvvvv 【全新的、更简洁的修正逻辑】 vvvvvv
+            std::shared_ptr<InferenceEngine> p1_engine, p2_engine;
 
-                            std::map<int, std::shared_ptr<InferenceEngine>> models = {
-                                {1, p1_engine},
-                                {-1, p2_engine}
-                            };
+            // mode 1: model1(旧) 先手 --> (p1=eng1, p2=eng2)
+            // mode 2: model2(新) 先手 --> (p1=eng2, p2=eng1)
+            // mode 0: 交替先后手
+            bool swap_models = (evaluation_mode_ == 2) || (evaluation_mode_ == 0 && game_idx % 2 != 0);
 
-                            while (true) {
-                                int current_player = game.get_current_player();
-                                auto& current_engine = models.at(current_player);
+            if (swap_models)
+            {
+                p1_engine = engine2_; // 新模型执黑 (P1)
+                p2_engine = engine1_; // 旧模型执白 (P2)
+            }
+            else
+            {
+                p1_engine = engine1_; // 旧模型执黑 (P1)
+                p2_engine = engine2_; // 新模型执白 (P2)
+            }
+            // ^^^^^^ 【全新的、更简洁的修正逻辑】 ^^^^^^
 
-                                auto initial_state_ptr = std::make_shared<const Gomoku>(game);
-                                auto root = std::make_unique<Node>(initial_state_ptr, nullptr, -1, 1.0f);
+            std::map<int, std::shared_ptr<InferenceEngine>> models = {
+                {1, p1_engine}, {-1, p2_engine}};
 
-                                // MCTS 搜索过程 (与自对弈类似，但使用C++推理引擎)
-                                std::vector<Node*> leaves;
-                                leaves.reserve(num_simulations_);
-                                for (int i = 0; i < num_simulations_; ++i) {
-                                    Node* node = root.get();
-                                    node->virtual_loss_count_++;
-                                    while (node->is_fully_expanded()) {
-                                        node = node->select_child(this->c_puct_);
-                                        node->virtual_loss_count_++;
-                                    }
-                                    auto [end_value, is_terminal] = node->game_state_->get_game_ended();
-                                    if (is_terminal) {
-                                        Node* temp_node = node;
-                                                while(temp_node != nullptr) {
-                                                    temp_node->virtual_loss_count_--;
-                                                    temp_node = temp_node->parent_;
-                                                }
-                                        node->backpropagate(end_value * node->game_state_->get_current_player());
-                                        continue;
-                                    }
-                                    leaves.push_back(node);
-                                }
+            while (true)
+            {
+                const Gomoku root_state(game);
+                auto &current_engine = models.at(game.get_current_player());
 
-                                if (!leaves.empty()) {
-                                    std::sort(leaves.begin(), leaves.end());
-                                    leaves.erase(std::unique(leaves.begin(), leaves.end()), leaves.end());
-                                    std::vector<std::vector<float>> state_batch;
-                                    state_batch.reserve(leaves.size());
-                                    for (const auto* leaf : leaves) {
-                                        state_batch.push_back(leaf->game_state_->get_state());
-                                    }
+                // 调用统一的MCTS核心函数，模式为EVALUATION
+                auto [action, policy, mcts_value] = find_best_action_by_mcts(
+                    root_state,
+                    game_history,
+                    *current_engine,
+                    this->mcts_config_,
+                    MCTS_MODE::EVALUATION,
+                    node_arena,
+                    gomoku_arena
+                );
+                // 在评估中，我们不关心返回的policy，所以可以忽略
 
-                                    // 使用当前玩家对应的C++推理引擎
-                                    auto [policy_batch, value_batch] = current_engine->infer(state_batch, this->board_size_, this->num_channels_);
+                if (action == -1)
+                    break;
 
-                                    for (size_t i = 0; i < leaves.size(); ++i) {
-                                            Node* leaf = leaves[i];
-                                            const auto& current_policy = policy_batch[i];
-
-                                            // 使用新的扩展逻辑，替换旧的 expand 调用
-                                            const auto& parent_state = *leaf->game_state_;
-                                            const auto valid_moves = parent_state.get_valid_moves();
-                                            leaf->children_.reserve(valid_moves.size());
-                                            for (size_t action = 0; action < current_policy.size(); ++action) {
-                                                if (current_policy[action] > 0.0f && valid_moves[action]) {
-                                                    auto next_game_state = std::make_shared<Gomoku>(parent_state);
-                                                    next_game_state->execute_move(action);
-                                                    leaf->children_.push_back(std::make_unique<Node>(
-                                                        next_game_state, leaf, action, current_policy[action]
-                                                    ));
-                                                }
-                                            }
-                                            leaf->backpropagate(static_cast<double>(value_batch[i]));
-                                        }
-                                }
-
-                                // in EvaluationManager::worker_func
-
-                                // --- 修改开始: 选择动作（随机化平局处理和回退逻辑）---
-                                int action = -1;
-                                if (!root->children_.empty()) {
-                                    int max_visits = -1;
-                                    for (const auto& child : root->children_) {
-                                        if (child && child->visit_count_ > max_visits) {
-                                            max_visits = child->visit_count_;
-                                        }
-                                    }
-
-                                    std::vector<int> best_actions;
-                                    for (const auto& child : root->children_) {
-                                        if (child && child->visit_count_ == max_visits) {
-                                            best_actions.push_back(child->action_taken_);
-                                        }
-                                    }
-
-                                    if (!best_actions.empty()) {
-                                        // 从所有最佳动作中随机选择一个
-                                        static thread_local std::mt19937 generator(std::random_device{}());
-                                        std::uniform_int_distribution<size_t> dist(0, best_actions.size() - 1);
-                                        action = best_actions[dist(generator)];
-                                    }
-                                }
-
-                                // 如果MCTS后仍然没有选出动作（例如根节点无法扩展），则随机选择一个合法的
-                                if (action == -1) {
-                                    auto valid_moves = game.get_valid_moves();
-                                    std::vector<int> valid_move_indices;
-                                    for (size_t i = 0; i < valid_moves.size(); ++i) {
-                                        if (valid_moves[i]) {
-                                            valid_move_indices.push_back(i);
-                                        }
-                                    }
-                                    if (!valid_move_indices.empty()) {
-                                        static thread_local std::mt19937 generator(std::random_device{}());
-                                        std::uniform_int_distribution<size_t> distrib(0, valid_move_indices.size() - 1);
-                                        action = valid_move_indices[distrib(generator)];
-                                    }
-                                }
-                                // --- 修改结束 ---
-
-
-                                if (action == -1) break; // No moves possible, end as draw
-
-                                game.execute_move(action);
-
-                                // 游戏结束判断
-                                auto [final_value, is_done] = game.get_game_ended();
-                                if (is_done) {
-                                    int winner_code = 0; // 默认为平局
-                                    if (std::abs(final_value) > 0.01) { // 判断是否真的分出了胜负
-                                        int winner_result = static_cast<int>(final_value); // 1 代表P1胜, -1 代表P2胜
-
-                                        // 关键：我们要记录的是 model1 和 model2 的胜负
-                                        // winner_code = 1 代表 model1 胜, -1 代表 model2 胜
-                                        if (winner_result == 1) { // 如果 P1 胜了
-                                            // 检查P1是哪个模型
-                                            winner_code = (&p1_engine == &engine1_) ? 1 : -1;
-                                        } else { // 如果 P2 胜了
-                                            // 检查P2是哪个模型
-                                            winner_code = (&p2_engine == &engine1_) ? 1 : -1;
-                                        }
-                                    }
-
-                                                // 使用线程锁，安全地更新总计分板
-                                                {
-                                                    std::lock_guard<std::mutex> lock(results_mutex_);
-                                                    scores_[winner_code]++;
-                                                }
-
-                                                break; // 退出当前这局游戏的循环
-                                                // ======================================================
-                                }
-                            }
-                } catch (const std::exception& e) {
-                    std::lock_guard<std::mutex> lock(g_io_mutex);
-                    std::cerr << "[C++ Eval Worker " << worker_id << ", Game " << game_idx
-                              << "] Exception: " << e.what() << std::endl;
-                } catch (...) {
-                    std::lock_guard<std::mutex> lock(g_io_mutex);
-                    std::cerr << "[C++ Eval Worker " << worker_id << ", Game " << game_idx
-                              << "] Unknown exception occurred!" << std::endl;
+                // 更新历史并执行动作
+                game_history.push_front(game.get_bitboard_state());
+                if (game_history.size() > static_cast<size_t>(this->mcts_config_.history_steps))
+                {
+                    game_history.pop_back();
                 }
+                game.execute_move(action);
 
+                /*if (worker_id == 0)
+                {
+                    std::lock_guard<std::mutex> lock(g_io_mutex);
+                    std::cout << "\n=======================================================\n";
+                    std::cout << "[Eval Game " << game_idx << ", Worker " << worker_id << "] Move #" << game.get_move_number() << "\n";
+                    std::cout << "Player " << game.get_current_player() * -1 << " (Engine: " << ((current_engine == engine1_) ? "Model1-Old" : "Model2-New") << ") chose action: " << action << "\n";
+                    game.print_board();
+                    std::cout << "=======================================================\n";
+                }*/
 
+                auto [final_value, is_done] = game.get_game_ended();
+                if (is_done)
+                {
+                    int winner_code = 0; // 0 for draw
+                    if (std::abs(final_value) > 0.01)
+                    {
+                        int winner_player = static_cast<int>(final_value); // 1 for P1 (black), -1 for P2 (white)
+
+                        // 判断胜利方的引擎是哪一个
+                        std::shared_ptr<InferenceEngine> winning_engine;
+                        if (winner_player == 1)
+                        {
+                            winning_engine = p1_engine;
+                        }
+                        else
+                        { // winner_player == -1
+                            winning_engine = p2_engine;
+                        }
+
+                        // 无论谁赢，都统一检查胜利的引擎是 model1 还是 model2
+                        if (winning_engine == engine1_)
+                        {
+                            winner_code = 1; // Model 1 (旧模型) 胜利
+                        }
+                        else
+                        {
+                            winner_code = -1; // Model 2 (新模型) 胜利
+                        }
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(results_mutex_);
+                        scores_[winner_code]++;
+                    }
+
+                    break;
+                }
+            }
+        }
+        catch (const std::exception &e)
+        {
+
+            std::lock_guard<std::mutex> lock(g_io_mutex);
+
+            std::cerr << "[C++ Eval Worker " << worker_id << ", Game " << game_idx
+
+                      << "] Exception: " << e.what() << std::endl;
+        }
+        catch (...)
+        {
+
+            std::lock_guard<std::mutex> lock(g_io_mutex);
+
+            std::cerr << "[C++ Eval Worker " << worker_id << ", Game " << game_idx
+
+                      << "] Unknown exception occurred!" << std::endl;
+        }
     }
 }
 
-// file: cpp_src/SelfPlayManager.cpp (替换这个函数)
+// file: cpp_src/SelfPlayManager.cpp
+// 用这个【最终、完全修正版】的函数，替换掉文件中旧的同名函数
 
 int find_best_action_for_state(
     py::list py_board_pieces,
     py::list py_board_territory,
     int current_player,
     int current_move_number,
-    const std::string& model_path,
+    const std::string &model_path,
     bool use_gpu,
     py::dict args)
 {
-    py::gil_scoped_release release;
-
+    // 1. 获取模型引擎
     auto engine = get_cached_engine(model_path, use_gpu);
 
-    double c_puct = args["C"].cast<double>();
+    // 2. 从Python传入的args字典，动态创建MCTS_Config结构体
+    MCTS_Config config;
+    config.num_simulations = args["num_searches"].cast<int>();
+    config.c_puct = args["C"].cast<double>();
+    config.mcts_batch_size = args["mcts_batch_size"].cast<int>();
+    config.history_steps = args["history_steps"].cast<int>();
 
+    // ====================== 【核心修正】 ======================
+    // 修正了通道数的计算逻辑，确保与Python训练时完全一致
+    int history_steps = args["history_steps"].cast<int>();
+    int state_channels = (history_steps + 1) * 4;         // (历史步数 + 当前状态) * 4个平面
+    int meta_channels = 4;                                // 4个元数据平面
+    config.num_channels = state_channels + meta_channels; // 总通道数，(3+1)*4 + 4 = 20
+    // =========================================================
+
+    // 在评估/对战模式下，其他启发式参数设为默认关闭状态
+    config.enable_opening_bias = false;
+    config.opening_bias_strength = 0.0f;
+    config.enable_ineffective_connection_penalty = args.contains("enable_ineffective_connection_penalty") ? args["enable_ineffective_connection_penalty"].cast<bool>() : false;
+    config.ineffective_connection_penalty_factor = args.contains("ineffective_connection_penalty_factor") ? args["ineffective_connection_penalty_factor"].cast<float>() : 0.0f;
+    // 从Python的args字典中动态读取领地启发参数
+    config.enable_territory_heuristic = args.contains("enable_territory_heuristic") ? args["enable_territory_heuristic"].cast<bool>() : false;
+    config.territory_heuristic_weight = args.contains("territory_heuristic_weight") ? args["territory_heuristic_weight"].cast<double>() : 0.0;
+    config.enable_territory_penalty = args.contains("enable_territory_penalty") ? args["enable_territory_penalty"].cast<bool>() : false;
+    config.territory_penalty_strength = args.contains("territory_penalty_strength") ? args["territory_penalty_strength"].cast<float>() : 0.0f;
+    config.dirichlet_alpha = 0.0;
+    config.dirichlet_epsilon = 0.0;
+    config.temperature_start = 0.0;
+    config.temperature_end = 0.0;
+    config.temperature_decay_moves = 0;
+    config.enable_opponent_territory_threat_bonus = args.contains("enable_opponent_territory_threat_bonus") ? args["enable_opponent_territory_threat_bonus"].cast<bool>() : false;
+    config.opponent_territory_threat_bonus_strength = args.contains("opponent_territory_threat_bonus_strength") ? args["opponent_territory_threat_bonus_strength"].cast<float>() : 1.5f;
+
+    // 3. 从Python列表恢复Gomoku的根状态
     int board_size = args["board_size"].cast<int>();
-    int max_total_moves = args.contains("max_total_moves") ? args["max_total_moves"].cast<int>() : 50;
-    int history_steps = args.contains("history_steps") ? args["history_steps"].cast<int>() : 0;
-
-    // 将Python list转换为位棋盘
-    uint64_t black_s[2] = {0,0}, white_s[2] = {0,0}, black_t[2] = {0,0}, white_t[2] = {0,0};
-    for (int r = 0; r < board_size; ++r) {
-        py::list row = py_board_pieces[r].cast<py::list>();
-        for (int c = 0; c < board_size; ++c) {
-            int piece = row[c].cast<int>();
-            if (piece == 0) continue;
-            int pos = r * board_size + c;
-            uint64_t mask = 1ULL << (pos % 64);
-            if (piece == 1) black_s[pos / 64] |= mask;
-            else white_s[pos / 64] |= mask;
-        }
-    }
-    for (int r = 0; r < board_size; ++r) {
-        py::list row = py_board_territory[r].cast<py::list>();
-        for (int c = 0; c < board_size; ++c) {
-            int territory = row[c].cast<int>();
-            if (territory == 0) continue;
-            int pos = r * board_size + c;
-            uint64_t mask = 1ULL << (pos % 64);
-            if (territory == 1) black_t[pos / 64] |= mask;
-            else white_t[pos / 64] |= mask;
-        }
-    }
-
-    Gomoku game(
-        board_size, max_total_moves, current_player, current_move_number,
-        black_s, white_s, black_t, white_t, history_steps
-    );
-
-    int num_simulations = args["num_searches"].cast<int>();
-    auto initial_state_ptr = std::make_shared<const Gomoku>(game);
-    auto root = std::make_unique<Node>(initial_state_ptr, nullptr, -1, 1.0f);
-
-    // ====================== MCTS 搜索逻辑 (唯一正确的版本) ======================
-    std::vector<Node*> leaves_batch;
-    leaves_batch.reserve(num_simulations);
-    for (int i = 0; i < num_simulations; ++i) {
-        Node* node = root.get();
-        node->virtual_loss_count_++;
-        while (node->is_fully_expanded()) {
-            node = node->select_child(c_puct);
-            node->virtual_loss_count_++;
-        }
-        auto [end_value, is_terminal] = node->game_state_->get_game_ended();
-        if (is_terminal) {
-            Node* temp_node = node;
-                while(temp_node != nullptr) {
-                    temp_node->virtual_loss_count_--;
-                    temp_node = temp_node->parent_;
-                }
-            node->backpropagate(end_value * node->game_state_->get_current_player());
-            continue;
-        }
-        leaves_batch.push_back(node);
-    }
-
-    if (!leaves_batch.empty()) {
-        std::sort(leaves_batch.begin(), leaves_batch.end());
-        leaves_batch.erase(std::unique(leaves_batch.begin(), leaves_batch.end()), leaves_batch.end());
-
-        std::vector<std::vector<float>> state_batch;
-        state_batch.reserve(leaves_batch.size());
-        for (const auto* leaf : leaves_batch) {
-            state_batch.push_back(leaf->game_state_->get_state());
-        }
-
-        int num_channels = (history_steps + 1) * 4 + 4;
-        auto [policy_batch, value_batch] = engine->infer(state_batch, board_size, num_channels);
-
-        for (size_t i = 0; i < leaves_batch.size(); ++i) {
-            Node* leaf = leaves_batch[i];
-            const auto& current_policy = policy_batch[i];
-            const auto& parent_state = *leaf->game_state_;
-            const auto valid_moves = parent_state.get_valid_moves();
-            leaf->children_.reserve(valid_moves.size());
-            for (size_t action_idx = 0; action_idx < current_policy.size(); ++action_idx) {
-                if (current_policy[action_idx] > 0.0f && valid_moves[action_idx]) {
-                    auto next_game_state = std::make_shared<Gomoku>(parent_state);
-                    next_game_state->execute_move(action_idx);
-                    leaf->children_.push_back(std::make_unique<Node>(
-                        next_game_state, leaf, action_idx, current_policy[action_idx]
-                    ));
-                }
+    int max_total_moves = args["max_total_moves"].cast<int>();
+    uint64_t black_s[2] = {0, 0}, white_s[2] = {0, 0}, black_t[2] = {0, 0}, white_t[2] = {0, 0};
+    for (int r = 0; r < board_size; ++r)
+    {
+        py::list row_p = py_board_pieces[r].cast<py::list>();
+        py::list row_t = py_board_territory[r].cast<py::list>();
+        for (int c = 0; c < board_size; ++c)
+        {
+            int piece = row_p[c].cast<int>();
+            if (piece != 0)
+            {
+                int pos = r * board_size + c;
+                uint64_t mask = 1ULL << (pos % 64);
+                if (piece == 1)
+                    black_s[pos / 64] |= mask;
+                else
+                    white_s[pos / 64] |= mask;
             }
-            leaf->backpropagate(static_cast<double>(value_batch[i]));
-        }
-    }
-    // ====================== MCTS 逻辑结束 ======================
-
-    // 选择最佳动作的逻辑
-    int action = -1;
-    if (!root->children_.empty()) {
-        int max_visits = -1;
-        for (const auto& child : root->children_) {
-            if (child && child->visit_count_ > max_visits) {
-                max_visits = child->visit_count_;
+            int territory = row_t[c].cast<int>();
+            if (territory != 0)
+            {
+                int pos = r * board_size + c;
+                uint64_t mask = 1ULL << (pos % 64);
+                if (territory == 1)
+                    black_t[pos / 64] |= mask;
+                else
+                    white_t[pos / 64] |= mask;
             }
         }
-        std::vector<int> best_actions;
-        for (const auto& child : root->children_) {
-            if (child && child->visit_count_ == max_visits) {
-                best_actions.push_back(child->action_taken_);
-            }
-        }
-        if (!best_actions.empty()) {
-            std::random_device rd;
-            std::mt19937 gen(rd());
-            std::uniform_int_distribution<size_t> dist(0, best_actions.size() - 1);
-            action = best_actions[dist(gen)];
-        }
     }
 
-    if (action == -1) {
-        auto valid_moves = game.get_valid_moves();
-        std::vector<int> valid_move_indices;
-        for (size_t i = 0; i < valid_moves.size(); ++i) {
-            if (valid_moves[i]) valid_move_indices.push_back(i);
-        }
-        if (!valid_move_indices.empty()) {
-            std::random_device rd;
-            std::mt19937 gen(rd());
-            std::uniform_int_distribution<> distrib(0, valid_move_indices.size() - 1);
-            action = valid_move_indices[distrib(gen)];
-        }
+    // 【修正】Gomoku的构造函数需要的是 num_rounds，而不是 max_total_moves
+    int num_rounds = max_total_moves / 2;
+    Gomoku root_state(
+        board_size, num_rounds,
+        current_player, current_move_number,
+        black_s, white_s, black_t, white_t, config.history_steps);
+
+    // 为人机对战创建一个空的history deque
+    std::deque<BitboardState> history;
+
+    TrivialArena node_arena(1024 * 1024 * 1024);
+    TrivialArena gomoku_arena(256 * 1024 * 1024);
+
+    int final_action = -1;
+    {
+        // 仅在进行纯C++的MCTS重度计算时，才释放GIL
+        py::gil_scoped_release release;
+
+        // 调用统一的MCTS核心函数
+        auto [best_action, policy, mcts_value] = find_best_action_by_mcts(
+            root_state,
+            history,
+            *engine,
+            config,
+            MCTS_MODE::EVALUATION,
+            node_arena,
+            gomoku_arena
+        );
+        final_action = best_action;
     }
-    return action;
+
+    // 返回最终动作
+    return final_action;
 }
