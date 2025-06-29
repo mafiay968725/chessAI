@@ -13,16 +13,21 @@ import queue  # ★★★ 新增：导入线程安全的队列模块 ★★★
 
 
 def find_latest_model_file():
-    path = ".";
-    max_epoch = -1;
+    """查找最新的 .pt 模型文件"""
+    path = "models"
+    if not os.path.isdir(path):
+        return None # 如果 models 文件夹不存在，直接返回 None
+    max_epoch = -1
     latest_file = None
-    # --- 修改正则表达式以匹配 "model_数字_任意字符.pt" ---
+    # 正则表达式只寻找 C++ 引擎能用的 .pt 文件
     pattern = re.compile(r"model_(\d+).*\.pt")
     for f in os.listdir(path):
         match = pattern.match(f)
         if match:
             epoch = int(match.group(1))
-            if epoch > max_epoch: max_epoch = epoch; latest_file = f
+            if epoch > max_epoch:
+                max_epoch = epoch
+                latest_file = os.path.join(path, f)
     return latest_file
 
 

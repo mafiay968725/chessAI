@@ -4,12 +4,12 @@ args = {
     'C': 2,
     'num_searches': 800,
     'num_iterations': 20,
-    'num_selfPlay_episodes': 300,
+    'num_selfPlay_episodes': 200,
     'num_cpu_threads': 18,
-    'training_steps_per_iteration': 500, # 每次迭代训练1000个mini-batch
+    'avg_new_sample_passes': 4.0,
     'batch_size': 256,
     'learning_rate': 0.001,
-    'data_max_size': 200000,
+    'data_max_size': 100000,
     'num_res_blocks': 20,
     'num_hidden': 256,
     'dirichlet_alpha': 0.5, #暂时从0.3调到0.5
@@ -49,11 +49,19 @@ args = {
 
     # 领地维持惩罚参数 (新功能)
     'enable_territory_penalty': True,      # True 表示启用该惩罚
-    'territory_penalty_strength': 0.7,   # 惩罚强度(一个负向的偏置)
+    'territory_penalty_strength': 0.5,   # 惩罚强度(一个负向的偏置)
 
-    # ★★★【新增】以下两行新参数 ★★★
+    # 防守奖励参数
     'enable_opponent_territory_threat_bonus': True, # 新的功能开关
     'opponent_territory_threat_bonus_strength': 0.8, # 奖励强度。1.5代表防守收益最高的点，其策略概率最多可提升150%
+    
+     # 优先经验池回放 (PER) 相关参数
+    'enable_per': True,                   # True 表示启用PER, False则退化为标准经验池
+    'per_alpha': 0.6,                     # 优先级指数，0=纯随机, 1=纯优先级
+    'per_beta_start': 0.4,                # 重要性采样权重的初始值，会随训练线性增长到1.0
+    'per_beta_frames': 1000000,           # beta增长到1.0所需的总训练steps
+    'per_epsilon': 1e-6,                  # 一个小常数，防止任何经验的优先级为0
+    
     # =======================================================
     'history_steps': 3, # 记录T-1, T-2, T-3三步历史
 }

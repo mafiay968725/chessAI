@@ -14,6 +14,7 @@ from collections import deque
 import platform
 import ctypes
 
+from replay_buffer import PrioritizedReplayBuffer
 from neural_net import ExtendedConnectNet
 from config import args
 import cpp_mcts_engine
@@ -73,10 +74,15 @@ def save_model(model, epoch, args):
     """
     保存模型，并自动生成带结构信息的文件名 (同时保存 .pth 和 .pt)
     """
+    model_dir = "models"
+    os.makedirs(model_dir, exist_ok=True) # 如果目录不存在，则创建它
+
     num_channels = args['num_channels']
     base_filename = f"model_{epoch}_{args['num_res_blocks']}x{args['num_hidden']}_{num_channels}c"
     model_path_pth = f"{base_filename}.pth"
     model_path_pt = f"{base_filename}.pt"
+    model_path_pth = os.path.join(model_dir, f"{base_filename}.pth")
+    model_path_pt = os.path.join(model_dir, f"{base_filename}.pt")
 
     torch.save(model.state_dict(), model_path_pth)
     print(f"模型 {model_path_pth} 已保存。")
@@ -95,7 +101,10 @@ def find_latest_model_file():
     """
     查找最新的模型文件，当轮次（epoch）相同时，选择最近被修改的文件。
     """
-    path = "."
+    path = "models"
+    if not os.path.isdir(path):
+        return None # 如果 models 文件夹不存在，直接返回 None
+    
     max_epoch = -1
     latest_file_info = None
     latest_mtime = -1
@@ -104,14 +113,14 @@ def find_latest_model_file():
     for f in os.listdir(path):
         match = pattern.match(f)
         if match:
-            epoch = int(match.group(1))
             full_path = os.path.join(path, f)
             mtime = os.path.getmtime(full_path)
+            epoch = int(match.group(1))
             if epoch > max_epoch or (epoch == max_epoch and mtime > latest_mtime):
                 max_epoch = epoch
                 latest_mtime = mtime
                 latest_file_info = {
-                    'path': f,
+                    'path': full_path,
                     'epoch': epoch,
                     'res_blocks': int(match.group(2)),
                     'hidden_units': int(match.group(3)),
@@ -124,35 +133,60 @@ class Coach:
     def __init__(self, model, args):
         self.model = model  # self.model 将始终代表“当前最优模型”
         self.args = args
-        self.training_data = deque(maxlen=self.args['data_max_size'])
+        if self.args.get('enable_per', False):
+            print("--- 启用优先经验池回放 (PER) ---")
+            self.training_data = PrioritizedReplayBuffer(
+                self.args['data_max_size'],
+                alpha=self.args.get('per_alpha', 0.6),
+                beta_start=self.args.get('per_beta_start', 0.4),
+                beta_frames=self.args.get('per_beta_frames', 1000000)
+            )
+        else:
+            print("--- 使用标准经验池 ---")
+            self.training_data = deque(maxlen=self.args['data_max_size'])
         self.scaler = torch.amp.GradScaler(enabled=(device.type == 'cuda'))
 
     # ====================== 【核心改动 1】train函数参数化 ======================
-    # 让train函数可以灵活地训练任何模型，而不仅仅是self.model
-    # 这是修改后的 train 函数
-    def train(self, model_to_train, optimizer, scheduler=None):
+    def train(self, model_to_train, optimizer, scheduler=None, steps=None):
         """
         对给定的模型和优化器执行一个训练周期，并返回平均损失。
+        此版本集成了PER的采样和优先级更新逻辑。
         """
+        if steps is None:
+            steps = 250
         model_to_train.train()
-
-        # --- 新增：初始化损失列表 ---
         policy_losses = []
         value_losses = []
 
-        for _ in tqdm.tqdm(range(self.args.get('training_steps_per_iteration', 500)), desc="训练模型 Steps"):
+        is_per_enabled = isinstance(self.training_data, PrioritizedReplayBuffer)
+
+        for _ in tqdm.tqdm(range(steps), desc="训练模型 Steps"):
             if len(self.training_data) < self.args['batch_size']:
-                # ...
                 continue
 
-            batch = random.sample(self.training_data, self.args['batch_size'])
-            # ... (数据增强逻辑不变) ...
+            # --- PER 采样逻辑 ---
+            if is_per_enabled:
+                states_list, policies_list, values_list, indices, weights = self.training_data.sample(self.args['batch_size'])
+                weights = weights.to(device).unsqueeze(1) # 准备好用于损失计算的权重
+            else: # --- 标准采样逻辑 ---
+                batch = random.sample(self.training_data, self.args['batch_size'])
+                states_list, policies_list, values_list = zip(*batch)
+
+            # --- 数据增强（与之前相同） ---
             augmented_batch = []
-            for state, policy, value in batch:
-                augmented_samples = get_augmented_data(state, policy, self.args['board_size'],
-                                                       self.args['num_channels'])
+            for state, policy, value in zip(states_list, policies_list, values_list):
+                augmented_samples = get_augmented_data(state, policy, self.args['board_size'], self.args['num_channels'])
                 for aug_s, aug_p in augmented_samples:
                     augmented_batch.append((aug_s, aug_p, value))
+            
+            # 由于数据增强，我们需要扩展PER的权重和索引
+            if is_per_enabled:
+                num_augments = len(augmented_batch) // self.args['batch_size']
+                original_indices = np.copy(indices)
+                original_weights = weights.clone()
+                
+                indices = np.repeat(original_indices, num_augments)
+                weights = original_weights.repeat(num_augments, 1)
 
             states, target_policies, target_values = zip(*augmented_batch)
             states = torch.tensor(np.array(states), dtype=torch.float32).to(device)
@@ -162,13 +196,29 @@ class Coach:
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
                 pred_log_policies, pred_values = model_to_train(states)
-                policy_loss = -torch.sum(target_policies * pred_log_policies) / len(target_policies)
-                value_loss = F.mse_loss(pred_values, target_values)
-                total_loss = policy_loss + self.args['value_loss_weight'] * value_loss
+                
+                # --- 计算损失 ---
+                policy_loss = -torch.sum(target_policies * pred_log_policies, dim=1)
+                value_loss = F.mse_loss(pred_values, target_values, reduction='none') # reduction='none' 以便计算每个样本的TD-Error
+                
+                # --- PER 损失加权 ---
+                if is_per_enabled:
+                    # 使用重要性采样权重来加权总损失
+                    total_loss = (weights * (policy_loss + self.args['value_loss_weight'] * value_loss.squeeze())).mean()
+                    
+                    # --- 更新优先级 ---
+                    # 我们需要将增强后的TD-Error聚合回原始样本
+                    # 一个简单的方法是取每个原始样本所有增强版本的TD-Error的平均值
+                    td_errors = value_loss.squeeze().detach().cpu().numpy()
+                    td_errors_reshaped = td_errors.reshape(self.args['batch_size'], num_augments)
+                    avg_td_errors = td_errors_reshaped.mean(axis=1)
+                    
+                    self.training_data.update_priorities(original_indices, avg_td_errors)
+                else: # --- 标准损失计算 ---
+                    total_loss = policy_loss.mean() + self.args['value_loss_weight'] * value_loss.mean()
 
-            # --- 新增：将当前批次的损失记录下来 ---
-            policy_losses.append(policy_loss.item())
-            value_losses.append(value_loss.item())
+            policy_losses.append(policy_loss.mean().item())
+            value_losses.append(value_loss.mean().item())
 
             self.scaler.scale(total_loss).backward()
             self.scaler.step(optimizer)
@@ -177,13 +227,9 @@ class Coach:
             if scheduler is not None:
                 scheduler.step()
 
-        # --- 新增：计算并返回平均损失 ---
         avg_policy_loss = np.mean(policy_losses) if policy_losses else 0
         avg_value_loss = np.mean(value_losses) if value_losses else 0
         return avg_policy_loss, avg_value_loss
-
-    # file: coach.py
-    # 请用这个新版本的函数，完整替换掉文件中旧的 learn 函数
 
     # file: coach.py
     # 这是最终的、实现了“目标驱动”逻辑的 learn 函数，请用它替换旧版本
@@ -243,6 +289,7 @@ class Coach:
             print("自对弈完成！正在收集和筛选新数据...")
             games_processed, good_steps_collected, bad_steps_discarded = 0, 0, 0
             policy_entropies = []
+            is_per_enabled = isinstance(self.training_data, PrioritizedReplayBuffer)
             while not final_data_queue.empty():
                 try:
                     result = final_data_queue.get_nowait()
@@ -252,7 +299,10 @@ class Coach:
                         enable_filtering = self.args.get('filter_zero_policy_data', True)
                         for state, policy, value in game_data:
                             if not enable_filtering or np.any(policy):
-                                self.training_data.append((state, policy, value))
+                                if is_per_enabled:
+                                    self.training_data.add(state, policy, value)
+                                else:
+                                    self.training_data.append((state, policy, value)) 
                                 p_vec = np.array(policy)
                                 p_vec = p_vec[p_vec > 0]
                                 if p_vec.size > 0:
@@ -263,6 +313,7 @@ class Coach:
                                 bad_steps_discarded += 1
                 except queue.Empty:
                     break
+    
 
             print(
                 f"数据处理完成！本轮共处理 {games_processed} 局, 收集到 {good_steps_collected} 个有效步骤, 丢弃 {bad_steps_discarded} 个。")
@@ -272,7 +323,14 @@ class Coach:
                 print("警告：经验池数据不足，跳过本次训练和评估。")
                 model_was_promoted = False
                 continue
-
+            
+            #动态设置训练轮数
+            avg_new_sample_passes = self.args.get('avg_new_sample_passes', 2.0)
+            dynamic_training_steps = int(good_steps_collected / self.args['batch_size'] * avg_new_sample_passes) 
+            # 设置一个最小训练步数，防止在数据极少时训练不足
+            min_steps = 50 
+            training_steps_to_run = max(min_steps, dynamic_training_steps)
+            print(f"动态计算训练步数：{training_steps_to_run} (基于本轮收集的 {good_steps_collected} 个新样本)")
             promotion_achieved_this_attempt = False
 
             # --- 步骤 3: 训练与评估候选模型 ---
@@ -288,7 +346,7 @@ class Coach:
                 candidate_model.load_state_dict(self.model.state_dict())
 
                 optimizer = optim.Adam(candidate_model.parameters(), lr=self.args['learning_rate'], weight_decay=0.0001)
-                avg_p_loss, avg_v_loss = self.train(candidate_model, optimizer)
+                avg_p_loss, avg_v_loss = self.train(candidate_model, optimizer, steps=training_steps_to_run)
                 print(f"  - 训练损失: Policy Loss={avg_p_loss:.4f}, Value Loss={avg_v_loss:.4f}")
 
                 print("\n步骤3.2: 评估候选模型 vs. 最优模型...")
