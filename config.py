@@ -24,7 +24,7 @@ args = {
     'temperature_decay_moves': 15, #暂时从10拉到15
 
     # 评估体系参数
-    'num_eval_games': 20,
+    'num_eval_games': 30,
     'board_size': 9,
     'num_rounds': 25, # 每局游戏的回合数，总步数为 num_rounds * 2
     'mcts_batch_size': 256,
